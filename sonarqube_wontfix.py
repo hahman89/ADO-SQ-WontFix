@@ -36,6 +36,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.webdriver.common.keys import Keys
 
 # ---- CONFIG ----
 PR_URL = "https://dev.azure.com/TrygCloud/TH.Commercial.Policy/_git/rsa-batch-prosit/pullrequest/34761"
@@ -56,69 +57,76 @@ options.add_experimental_option("useAutomationExtension", False)
 driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
+skipped = set()  # selenium element ids of buttons that failed, so we don't loop on them
+
+ACTIVE_BTN_XPATH = ("//button[@aria-haspopup='true' "
+                    "and contains(@aria-label, 'State button Active')]")
+ANY_STATE_BTN_XPATH = ("//button[@aria-haspopup='true' "
+                       "and contains(@aria-label, 'State button')]")
 
 def find_active_state_button():
-    """Returns the first still-active (not yet Won't fix) state button found,
-    or None if none are currently visible/loaded."""
-    buttons = driver.find_elements(
-        By.XPATH,
-        "//button[@aria-haspopup='true' and contains(@aria-label, 'State button') "
-        "and not(contains(@aria-label, \"Won't fix\"))]",
-    )
-    return buttons[0] if buttons else None
+    for b in driver.find_elements(By.XPATH, ACTIVE_BTN_XPATH):
+        if b.id not in skipped:
+            return b
+    return None
+
+
+def is_expanded(button):
+    try:
+        return button.get_attribute("aria-expanded") == "true"
+    except StaleElementReferenceException:
+        return False
+
+
+def is_active(button):
+    try:
+        return "Active" in (button.get_attribute("aria-label") or "")
+    except StaleElementReferenceException:
+        return False  # re-rendered, treat as changed
 
 
 def dismiss_one(button) -> bool:
-    """Clicks the state button, then clicks the target option in the menu
-    it controls. Returns True on success."""
-    
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
     time.sleep(0.3)
 
     button.click()
-    time.sleep(0.5)
-
-    expanded = button.get_attribute("aria-expanded")
-    controls_id = button.get_attribute("aria-controls")  
-    print(f"  after click: aria-expanded={expanded}, aria-controls={controls_id}")
-
-    if expanded != "true" or not controls_id:
-        
+    try:
+        WebDriverWait(driver, 3).until(lambda d: is_expanded(button))
+    except TimeoutException:
         print("  native click didn't expand menu, retrying with JS click...")
         driver.execute_script("arguments[0].click();", button)
-        time.sleep(0.5)
-        expanded = button.get_attribute("aria-expanded")
-        controls_id = button.get_attribute("aria-controls")
-        print(f"  after JS click: aria-expanded={expanded}, aria-controls={controls_id}")
+        try:
+            WebDriverWait(driver, 3).until(lambda d: is_expanded(button))
+        except TimeoutException:
+            print("  menu still not expanded. Skipping.")
+            return False
 
+    controls_id = button.get_attribute("aria-controls")
     if not controls_id:
-        print("  still no aria-controls id — can't locate the menu. Skipping.")
+        print("  no aria-controls id. Skipping.")
         return False
 
     try:
-        menu = wait.until(
-            EC.visibility_of_element_located((By.ID, controls_id))
-        )
-    except TimeoutException:
-        print(f"Menu with id '{controls_id}' never became visible.")
-        # Dump what IS on the page with that id, if anything, for debugging.
-        present = driver.find_elements(By.ID, controls_id)
-        print(f"  elements matching id (any visibility): {len(present)}")
-        if present:
-            print(f"  outerHTML snippet: {present[0].get_attribute('outerHTML')[:300]}")
-        return False
-
-    try:
+        menu = wait.until(EC.visibility_of_element_located((By.ID, controls_id)))
         option = menu.find_element(
             By.XPATH, f".//*[contains(normalize-space(text()), \"{TARGET_STATE_TEXT}\")]"
         )
-    except Exception:
-        print(f"Couldn't find '{TARGET_STATE_TEXT}' option in menu {controls_id}.")
-        print(f"  menu outerHTML snippet: {menu.get_attribute('outerHTML')[:500]}")
+    except Exception as e:
+        print(f"  couldn't open menu / find option: {type(e).__name__}")
         return False
 
     option.click()
-    time.sleep(0.8) 
+
+    try:
+        WebDriverWait(driver, 8).until(lambda d: not is_active(button))
+    except TimeoutException:
+        try:
+            print(f"  state didn't change; label is: {button.get_attribute('aria-label')}")
+        except StaleElementReferenceException:
+            pass
+        return False
+
+    time.sleep(0.2)  # small settle for the re-render
     return True
 
 
@@ -152,37 +160,42 @@ def main():
         return
 
     processed = 0
-    stale_retries = 0
+    idle_scrolls = 0
 
     while processed < MAX_ISSUES:
         btn = find_active_state_button()
 
         if btn is None:
-            
-            driver.execute_script("window.scrollBy(0, 1000);")
-            time.sleep(1)
-            btn_after_scroll = find_active_state_button()
-            if btn_after_scroll is None:
-                print("No more active issues found (after scroll check).")
+            # Nothing active in the loaded DOM: scroll the last thread into view
+            # to trigger lazy loading, and stop only after several no-change scrolls.
+            all_btns = driver.find_elements(By.XPATH, ANY_STATE_BTN_XPATH)
+            if not all_btns:
                 break
-            btn = btn_after_scroll
-
-        try:
-            success = dismiss_one(btn)
-        except StaleElementReferenceException:
-            stale_retries += 1
-            if stale_retries > 5:
-                print("Too many stale element errors — stopping.")
+            before = (len(all_btns), all_btns[-1].id)
+            driver.execute_script("arguments[0].scrollIntoView({block: 'end'});", all_btns[-1])
+            time.sleep(1.2)
+            after_btns = driver.find_elements(By.XPATH, ANY_STATE_BTN_XPATH)
+            after = (len(after_btns), after_btns[-1].id) if after_btns else None
+            idle_scrolls = idle_scrolls + 1 if after == before else 0
+            if idle_scrolls >= 3:
+                print("No more active issues found.")
                 break
             continue
 
+        idle_scrolls = 0
+        try:
+            success = dismiss_one(btn)
+        except StaleElementReferenceException:
+            continue  # re-render mid-action; just re-scan
+
         if success:
             processed += 1
-            stale_retries = 0
             print(f"Dismissed issue #{processed}")
         else:
-            print("Stopping due to failed dismissal — inspect manually.")
-            break
+            skipped.add(btn.id)
+            # close any open menu before moving on
+            webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.3)
 
     print(f"Done. Total dismissed: {processed}")
     driver.quit()

@@ -70,20 +70,17 @@ def find_active_state_button():
             return b
     return None
 
-
 def is_expanded(button):
     try:
         return button.get_attribute("aria-expanded") == "true"
     except StaleElementReferenceException:
         return False
 
-
 def is_active(button):
     try:
         return "Active" in (button.get_attribute("aria-label") or "")
     except StaleElementReferenceException:
         return False  # re-rendered, treat as changed
-
 
 def dismiss_one(button) -> bool:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
@@ -128,7 +125,6 @@ def dismiss_one(button) -> bool:
 
     time.sleep(0.2)  # small settle for the re-render
     return True
-
 
 def main():
     PR_URL = input("Enter PR URL: ")
@@ -199,7 +195,6 @@ def main():
 
     print(f"Done. Total dismissed: {processed}")
     driver.quit()
-
 
 if __name__ == "__main__":
     main()
